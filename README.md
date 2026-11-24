@@ -1,8 +1,8 @@
 # librettist
 
-*The quiet scribe for your meetings — 100% local, offline, free AI meeting notes for macOS.*
+*local, offline, free AI meeting notes for macOS*
 
-Record live meetings (Zoom, Google Meet, Microsoft Teams, or in-person) directly from your terminal—**no meeting bots, no subscriptions, no BlackHole virtual audio driver, and no cloud uploads**.
+Record live meetings (Zoom, Google Meet, Microsoft Teams, or in-person) directly from your terminal.
 
 - **Botless system + mic audio capture:** Native macOS `ScreenCaptureKit` Swift binary captures both your voice and remote participants.
 - **Local transcription:** Apple Silicon–accelerated [`whisper.cpp`](https://github.com/ggml-org/whisper.cpp) (`ggml-small.en.bin`).
