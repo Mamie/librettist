@@ -1,0 +1,15 @@
+# Compiled binaries
+bin/meeting-recorder
+
+# Runtime / user artifacts
+.state/
+models/
+*.wav
+*.m4a
+*.aiff
+*.log
+
+# Python & macOS
+__pycache__/
+*.pyc
+.DS_Store
