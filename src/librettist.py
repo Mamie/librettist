@@ -43,7 +43,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "whisper_language": "en",
     "ollama_model": "qwen2.5:7b",
     "ollama_url": "http://127.0.0.1:11434",
-    "ollama_num_ctx": 16384,
+    "ollama_num_ctx": 32768,
     "keep_audio": False,
     "auto_open_note": True,
     "capture_system_audio": True,
@@ -380,22 +380,38 @@ def call_ollama(prompt: str, system_prompt: str, cfg: dict[str, Any]) -> str:
         raise RuntimeError(f"Ollama HTTP {exc.code}: {detail}") from exc
 
 
+def clean_transcript_for_llm(transcript: str) -> str:
+    """Strip Whisper non-speech filler lines like (clanking), (crickets chirping), [BLANK_AUDIO]."""
+    filler_re = re.compile(
+        r"^(\[\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}\]\s*)?"
+        r"(\([^)]{1,40}\)|\[[A-Z_ ]{2,30}\]|♪.*♪)\s*$"
+    )
+    cleaned = [ln for ln in transcript.splitlines() if ln.strip() and not filler_re.match(ln.strip())]
+    return "\n".join(cleaned)
+
+
 def summarize_transcript(transcript: str, title: str, manual_notes: str, cfg: dict[str, Any]) -> str:
     system_prompt = (
-        "You are an expert executive assistant that turns raw meeting transcripts into crisp, "
-        "accurate, actionable Markdown meeting notes. Never invent facts, owners, or decisions "
-        "not grounded in the transcript or user notes. If a section has nothing relevant, write 'None noted.'"
+        "You are an expert technical & executive note-taker (comparable to Notion AI Meeting Notes). "
+        "Turn raw meeting transcripts into thorough, concrete, well-structured Markdown notes. "
+        "Preserve specific details, technical terms, figure/section numbers, metrics, rationales, "
+        "disagreements, names, and dates/schedules discussed. Silently fix obvious speech-to-text "
+        "phonetic errors when clear from context (e.g., matching the meeting title or domain terms), "
+        "but NEVER invent facts, decisions, or owners not supported by the transcript. "
+        "Do NOT over-compress long meetings into a handful of vague bullets—organize detailed notes "
+        "by topic with clear subheadings."
     )
 
-    max_chars = 32000
-    working_transcript = transcript
-    if len(transcript) > max_chars:
-        log("Long transcript detected; summarizing in chunks...")
+    cleaned = clean_transcript_for_llm(transcript)
+    max_chars = 70000
+    working_transcript = cleaned
+    if len(cleaned) > max_chars:
+        log("Very long transcript detected; extracting detailed per-segment notes first...")
         chunks: list[str] = []
         buf: list[str] = []
         buf_len = 0
-        for ln in transcript.splitlines():
-            if buf_len + len(ln) + 1 > max_chars and buf:
+        for ln in cleaned.splitlines():
+            if buf_len + len(ln) + 1 > 45000 and buf:
                 chunks.append("\n".join(buf))
                 buf = [ln]
                 buf_len = len(ln)
@@ -409,11 +425,12 @@ def summarize_transcript(transcript: str, title: str, manual_notes: str, cfg: di
         for idx, chunk in enumerate(chunks, start=1):
             chunk_prompt = (
                 f"Meeting title: {title}\n"
-                f"Part {idx} of {len(chunks)}. Extract key discussion points, decisions, "
-                "action items (with owners/deadlines if stated), and open questions as concise bullets.\n\n"
+                f"Part {idx} of {len(chunks)}. Write detailed, faithful notes for this segment. "
+                "Preserve EVERY specific topic, technical detail, figure/item feedback, metric, "
+                "decision, action item (with exact owner only if clearly stated), and date/schedule mentioned.\n\n"
                 f"{chunk}"
             )
-            partial.append(f"### Part {idx}\n" + call_ollama(chunk_prompt, system_prompt, cfg))
+            partial.append(f"### Segment {idx}\n" + call_ollama(chunk_prompt, system_prompt, cfg))
         working_transcript = "\n\n".join(partial)
 
     notes_section = f"\nAdditional manual notes:\n{manual_notes}\n" if manual_notes else ""
@@ -422,21 +439,21 @@ def summarize_transcript(transcript: str, title: str, manual_notes: str, cfg: di
 Transcript:
 {working_transcript}
 
-Write structured Markdown notes using these exact headings:
+Write thorough, concrete Markdown notes using these exact top-level headings:
 ## TL;DR
-(2-3 concise sentences summarizing the purpose and main outcome)
+(3-4 sentences capturing the meeting goal, main outcomes, and next steps/dates)
 
-## Key Discussion Points
-- Bullet points grouped logically by topic
+## Detailed Discussion by Topic
+Organize into ### subheadings for each major topic, figure, or agenda item discussed. Under each subheading, include specific bullet points with concrete details, feedback, rationales, examples, and exact terms/metrics mentioned (avoid vague high-level summaries).
 
 ## Decisions Made
-- Clear list of concrete decisions
+- Concrete decisions agreed on during the meeting
 
 ## Action Items
-- [ ] Task description (Owner, if mentioned — Deadline, if mentioned)
+- [ ] Specific task (Owner, only if clearly stated — Deadline, only if clearly stated)
 
 ## Open Questions & Follow-ups
-- Unresolved questions or topics for next time
+- Unresolved questions, bugs/items to verify, and next meeting date/time if scheduled
 """
     log(f"Summarizing locally with Ollama ({cfg['ollama_model']})...")
     return call_ollama(final_prompt, system_prompt, cfg)
@@ -655,6 +672,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 def cmd_summarize(args: argparse.Namespace) -> int:
     cfg = load_config()
+    if getattr(args, "model", None):
+        cfg["ollama_model"] = args.model
     src = Path(args.input_file).expanduser().resolve()
     if not src.exists():
         print(f"Input file not found: {src}", file=sys.stderr)
@@ -684,6 +703,58 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         audio_saved_path=None,
     )
     print(f"Saved summary to: {out_path}")
+    return 0
+
+
+def cmd_resummarize(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    if args.model:
+        cfg["ollama_model"] = args.model
+
+    src = Path(args.note_file).expanduser().resolve()
+    if not src.exists():
+        print(f"Note file not found: {src}", file=sys.stderr)
+        return 1
+
+    text = src.read_text(encoding="utf-8")
+
+    transcript_match = re.search(
+        r"<details>\s*<summary>Full Transcript</summary>\s*```(?:text)?\n(.*?)\n```\s*</details>",
+        text,
+        re.DOTALL,
+    )
+    if not transcript_match:
+        print(
+            "Could not find a `<details><summary>Full Transcript</summary>` block in this file. "
+            "Use `librettist summarize` for plain transcripts.",
+            file=sys.stderr,
+        )
+        return 1
+    transcript = transcript_match.group(1).strip()
+
+    title_match = re.search(r'^title:\s*"?(.*?)"?\s*$', text, re.MULTILINE) or re.search(
+        r"^#\s+(.+)$", text, re.MULTILINE
+    )
+    title = args.title or (title_match.group(1).strip() if title_match else src.stem)
+
+    manual_match = re.search(r"## Manual Notes\s*\n+(.*?)(?:\n+---\s*\n+<details>)", text, re.DOTALL)
+    existing_notes = manual_match.group(1).strip() if manual_match else ""
+    combined_notes = "\n".join(p for p in [existing_notes, (args.notes or "").strip()] if p)
+
+    summary_md = summarize_transcript(transcript, title, combined_notes, cfg)
+
+    # Replace only the summary section between the metadata header and the trailing Manual Notes / Full Transcript.
+    summary_start = re.search(r"^##\s+TL;DR\b", text, re.MULTILINE)
+    tail_start = re.search(r"\n---\s*\n+(?:## Manual Notes|<details>)", text)
+    if summary_start and tail_start and summary_start.start() < tail_start.start():
+        updated = text[: summary_start.start()] + summary_md.strip() + "\n" + text[tail_start.start() :]
+    else:
+        print("Warning: non-standard note layout; prepending refreshed summary above transcript.", file=sys.stderr)
+        updated = f"# {title}\n\n{summary_md.strip()}\n\n---\n\n{transcript_match.group(0)}\n"
+
+    out_path = Path(args.output).expanduser().resolve() if args.output else src
+    out_path.write_text(updated, encoding="utf-8")
+    print(f"Updated summary in: {out_path}")
     return 0
 
 
@@ -753,8 +824,17 @@ def main() -> int:
     p_sum.add_argument("input_file", help="Path to audio (.m4a/.wav/.mp3) or transcript (.txt/.md)")
     p_sum.add_argument("--title", default=None, help="Meeting title")
     p_sum.add_argument("--notes", default=None, help="Optional manual notes")
+    p_sum.add_argument("--model", default=None, help="Override Ollama model for this run")
     p_sum.add_argument("--output-dir", default=None, help="Override output directory")
     p_sum.set_defaults(func=cmd_summarize)
+
+    p_resum = sub.add_parser("resummarize", aliases=["redo"], help="Re-generate the summary of an existing librettist Markdown note")
+    p_resum.add_argument("note_file", help="Path to an existing librettist .md note containing a Full Transcript")
+    p_resum.add_argument("--model", default=None, help="Override Ollama model (e.g. qwen2.5:14b)")
+    p_resum.add_argument("--title", default=None, help="Override meeting title")
+    p_resum.add_argument("--notes", default=None, help="Additional manual notes to incorporate")
+    p_resum.add_argument("--output", "-o", default=None, help="Write to a new file instead of updating in place")
+    p_resum.set_defaults(func=cmd_resummarize)
 
     p_stat = sub.add_parser("status", aliases=["doctor"], help="Check setup and active recording status")
     p_stat.set_defaults(func=cmd_status)
@@ -763,7 +843,7 @@ def main() -> int:
     p_cfg.set_defaults(func=cmd_config)
 
     # Default to interactive `record` if invoked with no subcommand or a bare title.
-    known_cmds = {"record", "rec", "start", "stop", "summarize", "status", "doctor", "config"}
+    known_cmds = {"record", "rec", "start", "stop", "summarize", "resummarize", "redo", "status", "doctor", "config"}
     argv = sys.argv[1:]
     if not argv:
         argv = ["record"]

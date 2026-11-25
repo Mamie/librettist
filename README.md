@@ -79,6 +79,9 @@ librettist status
 # Transcribe & summarize any existing audio file (.m4a, .mp3, .wav) or transcript (.txt)
 librettist summarize ~/Desktop/call.m4a --title "Customer Interview"
 
+# Re-run the summary on an existing librettist note (optionally with a larger Ollama model)
+librettist resummarize ~/Documents/MeetingNotes/2026-11-25_10-30_weekly-sync.md --model qwen2.5:14b
+
 # View your config file path & current settings
 librettist config
 ```
